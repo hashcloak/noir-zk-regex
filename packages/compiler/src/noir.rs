@@ -83,6 +83,7 @@ global table = comptime {{ make_lookup_table() }};
 pub fn regex_match<let N: u32>(input: [u8; N]) {{
     // regex: {regex_pattern}
     let mut s = 0;
+    s = table[s * 256 + 255 as Field];
     for i in 0..input.len() {{
         s = table[s * {BYTE_SIZE} + input[i] as Field];
     }}
