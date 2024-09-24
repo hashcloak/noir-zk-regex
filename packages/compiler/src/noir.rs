@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs::File, io::Write, iter::FromIterator, path::Path};
+use std::{fs::File, io::Write, path::Path};
 
 use itertools::Itertools;
 
@@ -15,7 +15,8 @@ pub fn gen_noir_fn(regex_and_dfa: &RegexAndDFA, path: &Path) -> Result<(), std::
 }
 
 fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
-    let accept_state_ids = {
+    // Multiple accepting states are not supported
+    let accept_state_id = {
         let accept_states = regex_and_dfa
             .dfa
             .states
@@ -23,79 +24,152 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
             .filter(|s| s.state_type == ACCEPT_STATE_ID)
             .map(|s| s.state_id)
             .collect_vec();
-        assert!(accept_states.len() > 0, "no accept states");
-        accept_states
+        assert!(
+            accept_states.len() == 1,
+            "there should be exactly 1 accept state"
+        );
+        *accept_states.get(0).unwrap()
     };
 
-    const BYTE_SIZE: u32 = 256; // u8 size
-    let mut lookup_table_body = String::new();
-
-    // curr_state + char_code -> next_state
-    let mut rows: Vec<(usize, u8, usize)> = vec![];
+    // Create the function that determines next state
+    let mut next_state_fn_body = String::new();
+    // Handle curr_state + char_code -> next_state
+    let mut rows: Vec<(usize, u8, u8, usize)> = vec![];
 
     for state in regex_and_dfa.dfa.states.iter() {
         for (&tran_next_state_id, tran) in &state.transitions {
-            for &char_code in tran {
-                rows.push((state.state_id, char_code, tran_next_state_id));
+            let mut sorted_chars: Vec<&u8> = tran.iter().collect();
+            sorted_chars.sort();
+
+            let mut current_range_start: Option<u8> = None;
+            let mut previous_char: Option<u8> = None;
+
+            for &char_code in sorted_chars {
+                if let Some(prev) = previous_char {
+                    if char_code == prev + 1 {
+                        // Extend the range if consecutive
+                        previous_char = Some(char_code);
+                    } else {
+                        // Push the completed range or single character
+                        rows.push((
+                            state.state_id,
+                            current_range_start.unwrap(),
+                            prev,
+                            tran_next_state_id,
+                        ));
+                        // Start a new range
+                        current_range_start = Some(char_code);
+                        previous_char = Some(char_code);
+                    }
+                } else {
+                    // First character in the range
+                    current_range_start = Some(char_code);
+                    previous_char = Some(char_code);
+                }
             }
-        }
-        if state.state_type == ACCEPT_STATE_ID {
-            let existing_char_codes = &state
-                .transitions
-                .iter()
-                .flat_map(|(_, tran)| tran.iter().copied().collect_vec())
-                .collect::<HashSet<_>>();
-            let all_char_codes = HashSet::from_iter(0..=255);
-            let mut char_codes = all_char_codes.difference(existing_char_codes).collect_vec();
-            char_codes.sort(); // to be deterministic
-            for &char_code in char_codes {
-                rows.push((state.state_id, char_code, state.state_id));
+
+            // Push the last range or single character
+            if let Some(start) = current_range_start {
+                rows.push((
+                    state.state_id,
+                    start,
+                    previous_char.unwrap(),
+                    tran_next_state_id,
+                ));
             }
         }
     }
 
-    for (curr_state_id, char_code, next_state_id) in rows {
-        lookup_table_body +=
-            &format!("table[{curr_state_id} * {BYTE_SIZE} + {char_code}] = {next_state_id};\n",);
+    let mut first_condition: Option<(u8, u8, usize)> = None;
+
+    // Add all rows to next state function
+    for (curr_state_id, start_char_code, end_char_code, next_state_id) in rows.iter() {
+        if first_condition.is_none() {
+            if start_char_code == end_char_code {
+                next_state_fn_body += &format!(
+                  "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n next = {next_state_id};\n}}"
+              );
+            } else {
+                next_state_fn_body += &format!(
+                  "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n next = {next_state_id};\n}}"
+              );
+            }
+            first_condition = Some((*start_char_code, *end_char_code, *next_state_id));
+        } else {
+            if start_char_code == end_char_code {
+                next_state_fn_body += &format!(
+                  " else if (s == {curr_state_id}) & (input == {start_char_code}) {{\n next = {next_state_id};\n}}"
+              );
+            } else {
+                next_state_fn_body += &format!(
+                  " else if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n next = {next_state_id};\n}}"
+              );
+            }
+        }
     }
 
-    lookup_table_body = indent(&lookup_table_body);
-    let table_size = BYTE_SIZE as usize * regex_and_dfa.dfa.states.len();
-    let lookup_table = format!(
+    // Add accepting state logic
+    if !regex_and_dfa.has_end_anchor {
+        if first_condition.is_none() {
+            next_state_fn_body +=
+                &format!("if (s == {accept_state_id}) {{\n  next = {accept_state_id};\n}}");
+        } else {
+            next_state_fn_body +=
+                &format!(" else if (s == {accept_state_id}) {{\n  next = {accept_state_id};\n}}");
+        }
+    }
+
+    // Add the restart for the first state transition, if nothing else has matched
+    // this is needed for a "restart"
+    if first_condition.is_some() {
+        let (char_start, char_end, next_state) = first_condition.unwrap();
+        // if the first transition is for 255, that is the indication of the beginning of the string
+        // for caret anchor support. So adding this transition is not needed
+        if char_start != 255 {
+            if char_start == char_end {
+                next_state_fn_body +=
+                    &format!(" else if (input == {char_start}) {{\n next = {next_state};\n}}");
+            } else {
+                next_state_fn_body += &format!(
+          " else if ((input >= {char_start}) & (input <= {char_end})) {{\n next = {next_state};\n}}"
+      );
+            }
+        }
+    }
+
+    next_state_fn_body = indent(&next_state_fn_body);
+    let next_state_fn = format!(
         r#"
-comptime fn make_lookup_table() -> [Field; {table_size}] {{
-    let mut table = [0; {table_size}];
-{lookup_table_body}
+fn next_state(s: Field, input: u8) -> Field {{
+    let mut next = 0;
+{next_state_fn_body}
 
-    table
+    next
 }}
-    "#
+  "#
     );
 
-    let final_states_condition_body = accept_state_ids
-        .iter()
-        .map(|id| format!("(s == {id})"))
-        .collect_vec()
-        .join(" | ");
     let fn_body = format!(
         r#"
-global table = comptime {{ make_lookup_table() }};
 pub fn regex_match<let N: u32>(input: [u8; N]) {{
     // regex: {regex_pattern}
     let mut s = 0;
+    s = next_state(s, 255);
+
     for i in 0..input.len() {{
-        s = table[s * {BYTE_SIZE} + input[i] as Field];
+        s = next_state(s, input[i]);
     }}
-    assert({final_states_condition_body}, f"no match: {{s}}");
+
+    assert(s == {accept_state_id}, f"no match: {{s}}");
 }}
-    "#,
+  "#,
         regex_pattern = regex_and_dfa.regex_pattern,
     );
     format!(
         r#"
-        {fn_body}
-        {lookup_table}
-    "#
+      {fn_body}
+      {next_state_fn}
+  "#
     )
     .trim()
     .to_owned()
