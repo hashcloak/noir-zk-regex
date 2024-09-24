@@ -6,15 +6,29 @@ use crate::structs::RegexAndDFA;
 
 const ACCEPT_STATE_ID: &str = "accept";
 
-pub fn gen_noir_fn(regex_and_dfa: &RegexAndDFA, path: &Path) -> Result<(), std::io::Error> {
-    let noir_fn = to_noir_fn(regex_and_dfa);
+pub fn gen_noir_fn(
+    regex_and_dfa: &RegexAndDFA,
+    path: &Path,
+    gen_substrs: bool,
+) -> Result<(), std::io::Error> {
+    let noir_fn = to_noir_fn(regex_and_dfa, gen_substrs);
     let mut file = File::create(path)?;
     file.write_all(noir_fn.as_bytes())?;
     file.flush()?;
     Ok(())
 }
 
-fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
+/// Generates Noir code based on the DFA and whether a substring should be extracted.
+///
+/// # Arguments
+///
+/// * `regex_and_dfa` - The `RegexAndDFA` struct containing the regex pattern and DFA.
+/// * `gen_substrs` - A boolean indicating whether to generate substrings.
+///
+/// # Returns
+///
+/// A `String` that contains the Noir code
+fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
     // Multiple accepting states are not supported
     let accept_state_id = {
         let accept_states = regex_and_dfa
@@ -87,22 +101,22 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
         if first_condition.is_none() {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
-                  "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n next = {next_state_id};\n}}"
+                  "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};\n}}"
               );
             } else {
                 next_state_fn_body += &format!(
-                  "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n next = {next_state_id};\n}}"
+                  "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};\n}}"
               );
             }
             first_condition = Some((*start_char_code, *end_char_code, *next_state_id));
         } else {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
-                  " else if (s == {curr_state_id}) & (input == {start_char_code}) {{\n next = {next_state_id};\n}}"
+                  " else if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};\n}}"
               );
             } else {
                 next_state_fn_body += &format!(
-                  " else if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n next = {next_state_id};\n}}"
+                  " else if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};\n}}"
               );
             }
         }
@@ -115,7 +129,7 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
                 &format!("if (s == {accept_state_id}) {{\n  next = {accept_state_id};\n}}");
         } else {
             next_state_fn_body +=
-                &format!(" else if (s == {accept_state_id}) {{\n  next = {accept_state_id};\n}}");
+                &format!(" else if (s == {accept_state_id}) {{\n   next = {accept_state_id};\n}}");
         }
     }
 
@@ -137,7 +151,7 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA) -> String {
         }
     }
 
-    next_state_fn_body = indent(&next_state_fn_body);
+    next_state_fn_body = indent(&next_state_fn_body, 1);
     let next_state_fn = format!(
         r#"
 fn next_state(s: Field, input: u8) -> Field {{
@@ -149,8 +163,77 @@ fn next_state(s: Field, input: u8) -> Field {{
   "#
     );
 
-    let fn_body = format!(
-        r#"
+    // substring_ranges contains the transitions that belong to the substring.
+    //   in Noir we only need to know in what state the substring needs to be extracted, the transitions are not needed
+    //   Example: SubstringDefinitions { substring_ranges: [{(2, 3)}, {(6, 7), (7, 7)}, {(8, 9)}], substring_boundaries: None }
+    //   for each substring, get the first transition and get the end state
+    let substr_states: Vec<usize> = regex_and_dfa
+        .substrings
+        .substring_ranges
+        .iter()
+        .flat_map(|range_set| range_set.iter().next().map(|&(_, end_state)| end_state)) // Extract the second element (end state) of each tuple
+        .collect();
+    // Note: substring_boundaries is only filled if the substring info is coming from decomposed setting
+    //  and will be empty in the raw setting (using json file for substr transitions). This is why substring_ranges is used here
+
+    let fn_body = if gen_substrs {
+        // Fill each substring when at the corresponding state
+        // Per state potentially multiple substrings should be extracted
+        // The code keeps track of whether a substring was already in the making, or a new one is started
+        let mut conditions = substr_states
+            .iter()
+            .map(|state| {
+                format!(
+                    "if ((s_next == {state}) & (consecutive_substr == 0)) {{
+  let mut substr0 = BoundedVec::new();
+  substr0.push(temp);
+  substrings.push(substr0);
+  consecutive_substr = 1;
+  substr_count += 1;
+}} else if ((s_next == {state}) & (s == {state})) {{
+  let mut current: BoundedVec<Field, N> = substrings.get(substr_count - 1);
+  current.push(temp);
+  substrings.set(substr_count - 1, current);
+}} else if (s == {state}) {{
+  consecutive_substr = 0;
+}}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        conditions = indent(&conditions, 2); // Indent twice to align with the for loop's body
+
+        format!(
+            r#"
+pub fn regex_match<let N: u32>(input: [u8; N]) -> Vec<BoundedVec<Field, N>> {{
+    // regex: {regex_pattern}
+    let mut substrings: Vec<BoundedVec<Field, N>> = Vec::new();
+    // Workaround for pop bug with Vec
+    let mut substr_count = 0;
+
+    // "Previous" state
+    let mut s: Field = 0;
+    // "Next"/upcoming state
+    let mut s_next: Field = 0;
+    s = next_state(s, 255);
+    let mut consecutive_substr = 0;
+
+    for i in 0..input.len() {{
+        s_next = next_state(s, input[i]);
+        let temp = input[i] as Field;
+        // Fill up substrings
+{conditions}
+        s = s_next;
+    }}
+
+    assert(s == {accept_state_id}, f"no match: {{s}}");
+    substrings
+}}
+  "#,
+            regex_pattern = regex_and_dfa.regex_pattern,
+        )
+    } else {
+        format!(
+            r#"
 pub fn regex_match<let N: u32>(input: [u8; N]) {{
     // regex: {regex_pattern}
     let mut s = 0;
@@ -163,8 +246,10 @@ pub fn regex_match<let N: u32>(input: [u8; N]) {{
     assert(s == {accept_state_id}, f"no match: {{s}}");
 }}
   "#,
-        regex_pattern = regex_and_dfa.regex_pattern,
-    );
+            regex_pattern = regex_and_dfa.regex_pattern,
+        )
+    };
+
     format!(
         r#"
       {fn_body}
@@ -175,13 +260,16 @@ pub fn regex_match<let N: u32>(input: [u8; N]) {{
     .to_owned()
 }
 
-fn indent(s: &str) -> String {
+/// Indents each line of the given string by a specified number of levels.
+/// Each level adds four spaces to the beginning of non-whitespace lines.
+fn indent(s: &str, level: usize) -> String {
+    let indent_str = "    ".repeat(level);
     s.split("\n")
         .map(|s| {
             if s.trim().is_empty() {
                 s.to_owned()
             } else {
-                format!("{}{}", "    ", s)
+                format!("{}{}", indent_str, s)
             }
         })
         .collect::<Vec<_>>()
