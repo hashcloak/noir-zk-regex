@@ -129,7 +129,15 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
     // This needs to be a new state, otherwise substring extraction won't work correctly
     if !regex_and_dfa.has_end_anchor {
         let original_accept_id = accept_state_ids.get(0).unwrap().clone();
-        let extra_accept_id = original_accept_id + 1;
+        // Create a new highest state
+        let extra_accept_id = regex_and_dfa
+            .dfa
+            .states
+            .iter()
+            .max_by_key(|state| state.state_id)
+            .map(|state| state.state_id)
+            .unwrap()
+            + 1;
         accept_state_ids.push(extra_accept_id);
         if first_condition.is_none() {
             next_state_fn_body +=
@@ -140,9 +148,8 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
             );
         }
         // And when that accepting state is encountered, stay in it.
-        next_state_fn_body += &format!(
-          " else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};\n}}"
-      );
+        next_state_fn_body +=
+            &format!(" else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};\n}}");
     }
 
     // Add the restart for the first state transition, if nothing else has matched
@@ -200,7 +207,7 @@ fn next_state(s: Field, input: u8) -> Field {{
                 let range_conditions = range_set
                     .iter()
                     .map(|(range_start, range_end)| {
-                        format!("(s == {range_start}) & (s_next == {range_end})")
+                        format!("((s == {range_start}) & (s_next == {range_end}))")
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
