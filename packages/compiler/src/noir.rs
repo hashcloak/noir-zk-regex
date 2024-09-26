@@ -30,7 +30,9 @@ pub fn gen_noir_fn(
 /// A `String` that contains the Noir code
 fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
     // Multiple accepting states are not supported
-    let accept_state_id = {
+    // This is a vector nonetheless, to support an extra accepting state we'll use
+    // to allow any character occurrences after the original accepting state
+    let mut accept_state_ids: Vec<usize> = {
         let accept_states = regex_and_dfa
             .dfa
             .states
@@ -42,7 +44,7 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
             accept_states.len() == 1,
             "there should be exactly 1 accept state"
         );
-        *accept_states.get(0).unwrap()
+        accept_states
     };
 
     // Create the function that determines next state
@@ -122,15 +124,25 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
         }
     }
 
-    // Add accepting state logic
+    // In case that there is no end_anchor, we add an additional accepting state to which any
+    // character occurence after the accepting state will go.
+    // This needs to be a new state, otherwise substring extraction won't work correctly
     if !regex_and_dfa.has_end_anchor {
+        let original_accept_id = accept_state_ids.get(0).unwrap().clone();
+        let extra_accept_id = original_accept_id + 1;
+        accept_state_ids.push(extra_accept_id);
         if first_condition.is_none() {
             next_state_fn_body +=
-                &format!("if (s == {accept_state_id}) {{\n  next = {accept_state_id};\n}}");
+                &format!("if (s == {original_accept_id}) {{\n  next = {extra_accept_id};\n}}");
         } else {
-            next_state_fn_body +=
-                &format!(" else if (s == {accept_state_id}) {{\n   next = {accept_state_id};\n}}");
+            next_state_fn_body += &format!(
+                " else if (s == {original_accept_id}) {{\n   next = {extra_accept_id};\n}}"
+            );
         }
+        // And when that accepting state is encountered, stay in it.
+        next_state_fn_body += &format!(
+          " else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};\n}}"
+      );
     }
 
     // Add the restart for the first state transition, if nothing else has matched
@@ -163,36 +175,47 @@ fn next_state(s: Field, input: u8) -> Field {{
   "#
     );
 
+    // Add check whether the final state is an accepting state
+    // From the DFA we should get a unique accepting state, but there can be
+    // an additional accepting state we created, if the regex doesn't end with $
+    let final_states_condition_body = accept_state_ids
+        .iter()
+        .map(|id| format!("(s == {id})"))
+        .collect_vec()
+        .join(" | ");
+
     // substring_ranges contains the transitions that belong to the substring
     let substr_ranges: &Vec<BTreeSet<(usize, usize)>> = &regex_and_dfa.substrings.substring_ranges;
     // Note: substring_boundaries is only filled if the substring info is coming from decomposed setting
     //  and will be empty in the raw setting (using json file for substr transitions). This is why substring_ranges is used here
 
     let fn_body = if gen_substrs {
-      let mut first_condition = true;
+        let mut first_condition = true;
 
-      let mut conditions = substr_ranges
-          .iter()
-          .enumerate()
-          .map(|(set_idx, range_set)| {
-              // Combine the range conditions into a single line using `|` operator
-              let range_conditions = range_set
-                  .iter()
-                  .map(|(range_start, range_end)| format!("(s == {range_start}) & (s_next == {range_end})"))
-                  .collect::<Vec<_>>()
-                  .join(" | ");
-      
-              // For the first condition, use `if`, for others, use `else if`
-              let start_part = if first_condition {
-                  first_condition = false;
-                  "if"
-              } else {
-                  "else if"
-              };
-      
-              // The body of the condition handling substring creation/updating
-              format!(
-                  "{start_part} ({range_conditions}) {{
+        let mut conditions = substr_ranges
+            .iter()
+            .enumerate()
+            .map(|(set_idx, range_set)| {
+                // Combine the range conditions into a single line using `|` operator
+                let range_conditions = range_set
+                    .iter()
+                    .map(|(range_start, range_end)| {
+                        format!("(s == {range_start}) & (s_next == {range_end})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+
+                // For the first condition, use `if`, for others, use `else if`
+                let start_part = if first_condition {
+                    first_condition = false;
+                    "if"
+                } else {
+                    "else if"
+                };
+
+                // The body of the condition handling substring creation/updating
+                format!(
+                    "{start_part} ({range_conditions}) {{
     if (consecutive_substr == 0) {{
       let mut substr{set_idx} = BoundedVec::new();
       substr{set_idx}.push(temp);
@@ -205,17 +228,17 @@ fn next_state(s: Field, input: u8) -> Field {{
       substrings.set(substr_count - 1, current);
     }}
 }}"
-              )
-          })
-          .collect::<Vec<_>>()
-          .join("\n");
-      
-      // Add the final else if for resetting the consecutive_substr
-      let final_conditions = format!(
-    "{conditions} else if (consecutive_substr == 1) {{
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Add the final else if for resetting the consecutive_substr
+        let final_conditions = format!(
+            "{conditions} else if (consecutive_substr == 1) {{
     consecutive_substr = 0;
 }}"
-      );
+        );
 
         conditions = indent(&final_conditions, 2); // Indent twice to align with the for loop's body
 
@@ -242,7 +265,7 @@ pub fn regex_match<let N: u32>(input: [u8; N]) -> Vec<BoundedVec<Field, N>> {{
         s = s_next;
     }}
 
-    assert(s == {accept_state_id}, f"no match: {{s}}");
+    assert({final_states_condition_body}, f"no match: {{s}}");
     substrings
 }}
   "#,
@@ -260,7 +283,7 @@ pub fn regex_match<let N: u32>(input: [u8; N]) {{
         s = next_state(s, input[i]);
     }}
 
-    assert(s == {accept_state_id}, f"no match: {{s}}");
+    assert({final_states_condition_body}, f"no match: {{s}}");
 }}
   "#,
             regex_pattern = regex_and_dfa.regex_pattern,
