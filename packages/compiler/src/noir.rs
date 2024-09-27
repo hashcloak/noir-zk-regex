@@ -98,27 +98,35 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
 
     let mut first_condition: Option<(u8, u8, usize)> = None;
 
+    // The reset boolean is needed when generating substrings
+    // It is set to false, unless matching the regex fails and the state is reset (to 0 or 1)
+    let reset_flip_if_needed = if gen_substrs {
+        "\n   reset = false;"
+    } else {
+        ""
+    };
+
     // Add all rows to next state function
     for (curr_state_id, start_char_code, end_char_code, next_state_id) in rows.iter() {
         if first_condition.is_none() {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
-                  "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};\n}}"
+                  "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
               );
             } else {
                 next_state_fn_body += &format!(
-                  "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};\n}}"
+                  "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
               );
             }
             first_condition = Some((*start_char_code, *end_char_code, *next_state_id));
         } else {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
-                  " else if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};\n}}"
+                  " else if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
               );
             } else {
                 next_state_fn_body += &format!(
-                  " else if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};\n}}"
+                  " else if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
               );
             }
         }
@@ -141,15 +149,15 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
         accept_state_ids.push(extra_accept_id);
         if first_condition.is_none() {
             next_state_fn_body +=
-                &format!("if (s == {original_accept_id}) {{\n  next = {extra_accept_id};\n}}");
+                &format!("if (s == {original_accept_id}) {{\n  next = {extra_accept_id};{reset_flip_if_needed}\n}}");
         } else {
             next_state_fn_body += &format!(
-                " else if (s == {original_accept_id}) {{\n   next = {extra_accept_id};\n}}"
+                " else if (s == {original_accept_id}) {{\n   next = {extra_accept_id};{reset_flip_if_needed}\n}}"
             );
         }
         // And when that accepting state is encountered, stay in it.
         next_state_fn_body +=
-            &format!(" else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};\n}}");
+            &format!(" else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};{reset_flip_if_needed}\n}}");
     }
 
     // Add the restart for the first state transition, if nothing else has matched
@@ -171,8 +179,28 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
     }
 
     next_state_fn_body = indent(&next_state_fn_body, 1);
-    let next_state_fn = format!(
-        r#"
+    let next_state_fn = if gen_substrs {
+        format!(
+            r#"
+struct StateInfo {{
+  next_state: Field,
+  reset: bool
+      }}
+
+fn next_state(s: Field, input: u8) -> StateInfo {{
+    let mut next = 0;
+    // Whether the move to the next state can be seen as a reset
+    // and what has been observed until now turned out to be invalid
+    let mut reset = true;
+{next_state_fn_body}
+
+    StateInfo{{ next_state: next, reset }}
+}}
+  "#
+        )
+    } else {
+        format!(
+            r#"
 fn next_state(s: Field, input: u8) -> Field {{
     let mut next = 0;
 {next_state_fn_body}
@@ -180,7 +208,8 @@ fn next_state(s: Field, input: u8) -> Field {{
     next
 }}
   "#
-    );
+        )
+    };
 
     // Add check whether the final state is an accepting state
     // From the DFA we should get a unique accepting state, but there can be
@@ -224,15 +253,10 @@ fn next_state(s: Field, input: u8) -> Field {{
                 format!(
                     "{start_part} ({range_conditions}) {{
     if (consecutive_substr == 0) {{
-      let mut substr{set_idx} = BoundedVec::new();
-      substr{set_idx}.push(temp);
-      substrings.push(substr{set_idx});
+      current_substring.push(temp);
       consecutive_substr = 1;
-      substr_count += 1;
     }} else if (consecutive_substr == 1) {{
-      let mut current: BoundedVec<Field, N> = substrings.get(substr_count - 1);
-      current.push(temp);
-      substrings.set(substr_count - 1, current);
+      current_substring.push(temp);
     }}
 }}"
                 )
@@ -240,9 +264,19 @@ fn next_state(s: Field, input: u8) -> Field {{
             .collect::<Vec<_>>()
             .join("\n");
 
+        // If a substring was in the making but there's a jump back to the start, remove it
+        // the substring was not valid
+
         // Add the final else if for resetting the consecutive_substr
         let final_conditions = format!(
-            "{conditions} else if (consecutive_substr == 1) {{
+            "{conditions} else if ((consecutive_substr == 1) & (s_next == 0)) {{
+    current_substring = BoundedVec::new();
+    consecutive_substr = 0;
+}} else if (consecutive_substr == 1) {{
+    // The substring is done so \"save\" it
+    substrings.push(current_substring);
+    // reset the substring holder for next use
+    current_substring = BoundedVec::new();
     consecutive_substr = 0;
 }}"
         );
@@ -254,25 +288,39 @@ fn next_state(s: Field, input: u8) -> Field {{
 pub fn regex_match<let N: u32>(input: [u8; N]) -> Vec<BoundedVec<Field, N>> {{
     // regex: {regex_pattern}
     let mut substrings: Vec<BoundedVec<Field, N>> = Vec::new();
-    // Workaround for pop bug with Vec
-    let mut substr_count = 0;
 
     // "Previous" state
     let mut s: Field = 0;
     // "Next"/upcoming state
     let mut s_next: Field = 0;
-    s = next_state(s, 255);
+    let stateInfo = next_state(s, 255);
+    s = stateInfo.next_state;
     let mut consecutive_substr = 0;
+    let mut current_substring = BoundedVec::new();
 
     for i in 0..input.len() {{
-        s_next = next_state(s, input[i]);
+        let stateInfo =  next_state(s, input[i]);
+        s_next = stateInfo.next_state;
         let temp = input[i] as Field;
+
+        // If a substring was in the making, but the state was reset
+        // we disregard previous progress because apparently it is invalid
+        if (stateInfo.reset & (consecutive_substr == 1)) {{
+            current_substring = BoundedVec::new();
+            consecutive_substr = 0;
+        }}
+
         // Fill up substrings
 {conditions}
         s = s_next;
     }}
 
     assert({final_states_condition_body}, f"no match: {{s}}");
+
+    // Add pending substring that hasn't been added
+    if consecutive_substr == 1 {{
+      substrings.push(current_substring);
+        }}
     substrings
 }}
   "#,
