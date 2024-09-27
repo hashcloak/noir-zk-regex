@@ -96,7 +96,15 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
         }
     }
 
-    let mut first_condition: Option<(u8, u8, usize)> = None;
+    // The first transitions that happen out of state 0
+    // disregarding the transition to 255
+    let first_transitions: Vec<(u8, u8, usize)> = rows
+        .clone()
+        .into_iter()
+        .filter(|(curr_state, char_start, _, _)| *curr_state == 0 && *char_start != 255)
+        .map(|(_, start, end, next)| (start, end, next))
+        .collect();
+    let mut first_condition: bool = true;
 
     // The reset boolean is needed when generating substrings
     // It is set to false, unless matching the regex fails and the state is reset (to 0 or 1)
@@ -107,8 +115,8 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
     };
 
     // Add all rows to next state function
-    for (curr_state_id, start_char_code, end_char_code, next_state_id) in rows.iter() {
-        if first_condition.is_none() {
+    for (curr_state_id, start_char_code, end_char_code, next_state_id) in rows.clone().iter() {
+        if first_condition {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
                   "if (s == {curr_state_id}) & (input == {start_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
@@ -118,7 +126,7 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
                   "if (s == {curr_state_id}) & (input >= {start_char_code}) & (input <= {end_char_code}) {{\n   next = {next_state_id};{reset_flip_if_needed}\n}}"
               );
             }
-            first_condition = Some((*start_char_code, *end_char_code, *next_state_id));
+            first_condition = false;
         } else {
             if start_char_code == end_char_code {
                 next_state_fn_body += &format!(
@@ -147,9 +155,9 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
             .unwrap()
             + 1;
         accept_state_ids.push(extra_accept_id);
-        if first_condition.is_none() {
+        if first_condition {
             next_state_fn_body +=
-                &format!("if (s == {original_accept_id}) {{\n  next = {extra_accept_id};{reset_flip_if_needed}\n}}");
+                &format!("if (s == {original_accept_id}) {{\n   next = {extra_accept_id};{reset_flip_if_needed}\n}}");
         } else {
             next_state_fn_body += &format!(
                 " else if (s == {original_accept_id}) {{\n   next = {extra_accept_id};{reset_flip_if_needed}\n}}"
@@ -160,21 +168,15 @@ fn to_noir_fn(regex_and_dfa: &RegexAndDFA, gen_substrs: bool) -> String {
             &format!(" else if (s == {extra_accept_id}) {{\n   next = {extra_accept_id};{reset_flip_if_needed}\n}}");
     }
 
-    // Add the restart for the first state transition, if nothing else has matched
+    // Add the restart for transitions out of 0, if nothing else has matched
     // this is needed for a "restart"
-    if first_condition.is_some() {
-        let (char_start, char_end, next_state) = first_condition.unwrap();
-        // if the first transition is for 255, that is the indication of the beginning of the string
-        // for caret anchor support. So adding this transition is not needed
-        if char_start != 255 {
-            if char_start == char_end {
-                next_state_fn_body +=
-                    &format!(" else if (input == {char_start}) {{\n next = {next_state};\n}}");
-            } else {
-                next_state_fn_body += &format!(
-          " else if ((input >= {char_start}) & (input <= {char_end})) {{\n next = {next_state};\n}}"
-      );
-            }
+    for (char_start, char_end, next_state) in first_transitions {
+        if char_start == char_end {
+            next_state_fn_body +=
+                &format!(" else if (input == {char_start}) {{\n   next = {next_state};\n}}");
+        } else {
+            next_state_fn_body += &format!(
+          " else if ((input >= {char_start}) & (input <= {char_end})) {{\n   next = {next_state};\n}}");
         }
     }
 
@@ -300,6 +302,10 @@ pub fn regex_match<let N: u32>(input: [u8; N]) -> Vec<BoundedVec<Field, N>> {{
 
     for i in 0..input.len() {{
         let stateInfo =  next_state(s, input[i]);
+        if stateInfo.reset {{
+            // If there was a reset, we consider the previous state to be 0.
+            s = 0;
+        }}
         s_next = stateInfo.next_state;
         let temp = input[i] as Field;
 
@@ -320,7 +326,7 @@ pub fn regex_match<let N: u32>(input: [u8; N]) -> Vec<BoundedVec<Field, N>> {{
     // Add pending substring that hasn't been added
     if consecutive_substr == 1 {{
       substrings.push(current_substring);
-        }}
+    }}
     substrings
 }}
   "#,
